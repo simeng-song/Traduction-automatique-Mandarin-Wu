@@ -18,7 +18,7 @@ def _():
     import tensorflow as tf
     from tensorflow.keras import layers
     from tensorflow.keras.layers import TextVectorization
-    return TextVectorization, layers, os, pd, tf
+    return TextVectorization, layers, np, os, pd, tf
 
 
 @app.cell
@@ -248,9 +248,12 @@ def _(
 @app.cell
 def _(layers, tf):
     class PositionalEmbedding(layers.Layer):
-        def __init__(self, vocab_size, d_model, max_len):
-            super().__init__()
+        def __init__(self, vocab_size, d_model, max_len, **kwargs):
+            super().__init__(**kwargs)
+            self.vocab_size = vocab_size
             self.d_model = d_model
+            self.max_len = max_len
+
             self.token_emb = layers.Embedding(vocab_size, d_model)
             self.pos_emb = layers.Embedding(max_len, d_model)
 
@@ -260,6 +263,15 @@ def _(layers, tf):
             pos_embeddings = self.pos_emb(positions)
             token_embeddings = self.token_emb(x)
             return token_embeddings + pos_embeddings
+
+        def get_config(self):
+            config = super().get_config()
+            config.update({
+                "vocab_size": self.vocab_size,
+                "d_model": self.d_model,
+                "max_len": self.max_len,
+            })
+            return config
     return (PositionalEmbedding,)
 
 
@@ -408,7 +420,7 @@ def _(model, tf):
 def _(EPOCHS_BASE, dev_ds, model, tf, train_ds_base):
     # Callbacks
     checkpoint_cb = tf.keras.callbacks.ModelCheckpoint(
-        "/home/sibel/Traduction-automatique-Mandarin-Wu/models/best_transformer_bt1_m2w.keras",
+        "/home/sibel/Traduction-automatique-Mandarin-Wu/models/best_base_m2w.keras",
         monitor='val_loss',
         save_best_only=True,
         verbose=1
@@ -460,7 +472,7 @@ def _(EPOCHS_BT, dev_ds, masked_accuracy, masked_loss, model, tf, train_ds_bt):
 
 @app.cell
 def _(model):
-    model.save("/home/sibel/Traduction-automatique-Mandarin-Wu/models/transformer_bt1_m2w.keras")
+    model.save("/home/sibel/Traduction-automatique-Mandarin-Wu/models/transformer_bt_m2w.keras")
     return
 
 
@@ -523,6 +535,189 @@ def _(translate):
     print( translate("今天天气真好") )
     print( translate("请你帮我一下") )
     print( translate("祝您开心") )
+    return
+
+
+@app.cell
+def _(mo):
+    mo.md(r"""### Évaluation""")
+    return
+
+
+@app.cell
+def _():
+    import sacrebleu
+    return (sacrebleu,)
+
+
+@app.cell
+def _(PositionalEmbedding, tf):
+    MBASE = "/home/sibel/Traduction-automatique-Mandarin-Wu/models/best_base_m2w.keras"
+    MBT   = "/home/sibel/Traduction-automatique-Mandarin-Wu/models/best_bt_m2w.keras"
+
+    base_model = tf.keras.models.load_model(
+        MBASE,
+        compile=False,
+        custom_objects={"PositionalEmbedding": PositionalEmbedding}
+    )
+
+    bt_model = tf.keras.models.load_model(
+        MBT,
+        compile=False,
+        custom_objects={"PositionalEmbedding": PositionalEmbedding}
+    )
+    return base_model, bt_model
+
+
+@app.cell
+def _(END_ID, MAX_TGT_LEN, START_ID, src_vectorizer, tf, tgt_vectorizer):
+    def translate_avec_model(model_obj, sentence, max_len=MAX_TGT_LEN):
+        src_seq = src_vectorizer([sentence])
+        dec_seq = [START_ID]
+
+        for _ in range(max_len):
+            dec_input = dec_seq + [0] * (MAX_TGT_LEN - len(dec_seq))
+            dec_input = tf.constant([dec_input], dtype=tf.int64)
+
+            logits = model_obj(
+                {"encoder_inputs": src_seq, "decoder_inputs": dec_input},
+                training=False
+            )
+
+            next_logits = logits[0, len(dec_seq) - 1, :]
+            next_id = int(tf.argmax(next_logits).numpy())
+
+            if next_id == 0 or next_id == END_ID:
+                break
+
+            dec_seq.append(next_id)
+
+        vocab = tgt_vectorizer.get_vocabulary()
+        out = []
+        for tid in dec_seq[1:]:
+            if tid < len(vocab):
+                ch = vocab[tid]
+                if ch:
+                    out.append(ch)
+
+        return "".join(out)
+    return (translate_avec_model,)
+
+
+@app.cell
+def _(base_model, bt_model, test_df, translate_avec_model):
+    src_sents = test_df["mandarin"].tolist()
+    refs = test_df["wu"].tolist()
+
+    base_hyps = [translate_avec_model(base_model, s) for s in src_sents]
+    bt_hyps   = [translate_avec_model(bt_model,   s) for s in src_sents]
+
+    print("Generated predictions:", len(src_sents))
+    print("Example baseline:", base_hyps[0])
+    print("Example + pseudo :", bt_hyps[0])
+    return base_hyps, bt_hyps, refs
+
+
+@app.cell
+def _(base_hyps, bt_hyps, refs, sacrebleu):
+    bleu_base = sacrebleu.corpus_bleu(
+        base_hyps,
+        [refs],
+        tokenize="char"
+    ).score
+
+    bleu_bt = sacrebleu.corpus_bleu(
+        bt_hyps,
+        [refs],
+        tokenize="char"
+    ).score
+
+    print("BLEU")
+    print("baseline:", bleu_base)
+    print("+pseudo :", bleu_bt)
+    return bleu_base, bleu_bt
+
+
+@app.cell
+def _(base_hyps, bt_hyps, refs, sacrebleu):
+    chrf_base = sacrebleu.corpus_chrf(
+        base_hyps,
+        [refs]
+    ).score
+
+    chrf_bt = sacrebleu.corpus_chrf(
+        bt_hyps,
+        [refs]
+    ).score
+
+    print("chrF")
+    print("baseline:", chrf_base)
+    print("+pseudo :", chrf_bt)
+    return chrf_base, chrf_bt
+
+
+@app.cell
+def _(bleu_base, bleu_bt, chrf_base, chrf_bt, pd):
+    metrics_df = pd.DataFrame([
+        {"model": "baseline", "BLEU": bleu_base, "chrF": chrf_base},
+        {"model": "+pseudo",  "BLEU": bleu_bt,   "chrF": chrf_bt},
+    ])
+
+    metrics_df
+    return
+
+
+@app.cell
+def _(mo):
+    mo.md(r"""### Visualisation""")
+    return
+
+
+@app.cell
+def _():
+    import matplotlib.pyplot as plt
+    return (plt,)
+
+
+@app.cell
+def _(bleu_base, bleu_bt, chrf_base, chrf_bt, np, plt):
+    labels = ["BLEU", "chrF"]
+    base_vals = [bleu_base, chrf_base]
+    bt_vals   = [bleu_bt,   chrf_bt]
+
+    x = np.arange(len(labels))
+    w = 0.35
+
+    plt.figure(figsize=(6, 4))
+    plt.bar(x - w/2, base_vals, width=w, label="baseline")
+    plt.bar(x + w/2, bt_vals,   width=w, label="+pseudo")
+    plt.xticks(x, labels)
+    plt.ylabel("score")
+    plt.title("Test set evaluation (sacrebleu)")
+    plt.legend()
+    plt.show()
+    return
+
+
+@app.cell
+def _(base_hyps, bt_hyps, pd, refs, test_df):
+    sample_idx = test_df.sample(n=20, random_state=42).index.tolist()
+
+    eval_table = pd.DataFrame({
+        "mandarin (src)": [test_df.loc[i, "mandarin"] for i in sample_idx],
+        "wu_ref (gold)":  [refs[i] for i in sample_idx],
+        "wu_baseline":    [base_hyps[i] for i in sample_idx],
+        "wu_pseudo":      [bt_hyps[i] for i in sample_idx],
+    })
+
+    eval_table
+    return (eval_table,)
+
+
+@app.cell
+def _(eval_table):
+    OUT_PATH = "/home/sibel/Traduction-automatique-Mandarin-Wu/eval_manual_20.csv"
+    eval_table.to_csv(OUT_PATH, index=False, encoding="utf-8-sig")
     return
 
 
